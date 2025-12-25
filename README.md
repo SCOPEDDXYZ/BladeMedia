@@ -1,6 +1,7 @@
 # Blade Media
 A simple & easy way to setup an automated Jellyfin-based media server. 
-*Created by Blade (@SCOPEDDDXYZ) with the help of AI.
+
+*Created by Blade (@SCOPEDDDXYZ) with the help of AI.*
 
 This docker-compose based setup script utilizes the following services:
 - MediaManager (This is an all-in-one replacement for Radarr, Sonarr & Jellyseerr.)
