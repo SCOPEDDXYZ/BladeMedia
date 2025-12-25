@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+print_banner() {
+  printf '\n\033[1;36m'
+  printf '==============================================\n'
+  printf '      🗡️  BladeMedia COMPLETE Setup  v2.0     \n'
+  printf '   Docker Stack + Auto-Organizer Service     \n'
+  printf '==============================================\n'
+  printf '\033[0m'
+}
+
+main() {
+  print_banner
+  
+  # === STEP 1: BladeMedia Root ===
+  local root
+  read -rp $'\033[1;33mEnter BladeMedia root (e.g. /srv/blademedia): \033[0m' root
+  
+  if [[ -z "$root" || ! "$root" =~ ^/ ]]; then
+    printf '\033[1;31mError: Must be absolute path\033[0m\n' >&2
+    exit 1
+  fi
+  
+  cd "$root" || exit 1
+  printf '\033[1;32m✅ Using: %s\033[0m\n\n' "$root"
+  
+  # === STEP 2: Discord Webhook (Optional) ===
+  local webhook
+  read -rp $'\033[1;33mDiscord webhook URL (Enter to skip): \033[0m' webhook
+  webhook="${webhook:-}"
+  
+  # === STEP 3: Install Docker (if needed) ===
+  printf '\n\033[1;34m🐳 Installing Docker...\033[0m\n'
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    sudo usermod -aG docker "$(id -u -n)"
+    sudo systemctl enable --now docker
+  fi
+  
+  # === STEP 4: Create BladeMedia Directory Structure ===
+  printf '\n\033[1;34m📁 Creating directory structure...\033[0m\n'
+  mkdir -p media/{movies,tv} downloads/{incomplete,complete,jackett} tdarr_cache
+  
+  # === STEP 5: Generate docker-compose.yml ===
+  printf '\n\033[1;34m🐳 Creating docker-compose.yml...\033[0m\n'
+  cat > docker-compose.yml << 'EOF'
+version: "3.9"
+
+networks:
+  media:
+    driver: bridge
+
+volumes:
+  jellyfin_cache:
+  jellyfin_config:
+  jackett_config:
+  rdtclient_config:
+  bazarr_config:
+  tdarr_config:
+  tdarr_logs:
+  tdarr_server_config:
+  mediamanager_config:
+  wizarr_config:
+
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: blademedia-jellyfin
+    networks: [media]
+    user: "0:0"
+    environment: [TZ=Etc/UTC]
+    volumes:
+      - jellyfin_config:/config
+      - jellyfin_cache:/cache
+      - ./media:/media
+    ports: ["8096:8096"]
+    restart: unless-stopped
+
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: blademedia-jackett
+    networks: [media]
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+    volumes:
+      - jackett_config:/config
+      - ./downloads/jackett:/downloads
+    ports: ["9117:9117"]
+    restart: unless-stopped
+
+  rdtclient:
+    image: rogerfar/rdtclient:latest
+    container_name: blademedia-rdtclient
+    networks: [media]
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+    volumes:
+      - rdtclient_config:/data/db
+      - ./downloads:/data/downloads
+    ports: ["6500:6500"]
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: blademedia-flaresolverr
+    networks: [media]
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=Etc/UTC
+    ports: ["8191:8191"]
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: blademedia-bazarr
+    networks: [media]
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+    volumes:
+      - bazarr_config:/config
+      - ./media:/media
+    ports: ["6767:6767"]
+    restart: unless-stopped
+
+  tdarr:
+    image: ghcr.io/tdarr/tdarr:latest
+    container_name: blademedia-tdarr
+    networks: [media]
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Etc/UTC
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+    volumes:
+      - tdarr_config:/app/configs
+      - tdarr_logs:/app/logs
+      - tdarr_server_config:/app/server
+      - ./media:/media
+      - ./tdarr_cache:/temp
+    ports:
+      - "8265:8265"
+      - "8266:8266"
+    restart: unless-stopped
+
+  mediamanager:
+    image: ghcr.io/maxdorninger/mediamanager:latest
+    container_name: blademedia-mediamanager
+    networks: [media]
+    environment: [TZ=Etc/UTC]
+    volumes:
+      - mediamanager_config:/app/data
+      - ./media:/media
+    ports: ["8787:8787"]
+    restart: unless-stopped
+
+  wizarr:
+    image: ghcr.io/wizarrrr/wizarr:latest
+    container_name: blademedia-wizarr
+    networks: [media]
+    environment: [TZ=Etc/UTC]
+    volumes: [wizarr_config:/data]
+    ports: ["5690:5690"]
+    restart: unless-stopped
+EOF
+
+  # === STEP 6: Install Python dependencies ===
+  printf '\n\033[1;34m🐍 Installing Python...\033[0m\n'
+  sudo apt update >/dev/null 2>&1 || sudo yum update -y >/dev/null 2>&1
+  sudo apt install -y python3 python3-pip || sudo yum install -y python3 python3-pip
+  pip3 install --user requests
+
+  # === STEP 7: Install Media Organizer ===
+  printf '\n\033[1;34m🎬 Installing Media Organizer...\033[0m\n'
+  cat > media_organizer.py << 'EOF'
+#!/usr/bin/env python3
+"""BladeMedia Organizer v2.1 - Complete Edition"""
+import os, re, shutil, argparse, requests, json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Optional
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class MediaOrganizer:
+    def __init__(self, root_path: str, dry_run: bool = False, discord_webhook: str = None):
+        self.root = Path(root_path)
+        self.movies_root = self.root / "media" / "movies"
+        self.tv_root = self.root / "media" / "tv"
+        self.dry_run = dry_run
+        self.discord_webhook = discord_webhook
+        self.summary = {"movies_organized": 0, "movies_skipped": 0, "tv_organized": 0, "tv_skipped": 0}
+        self.video_exts = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv'}
+        self.subtitle_exts = {'.srt', '.ass', '.ssa', '.sub', '.idx'}
+    
+    def send_discord(self, title: str, message: str, color: str = "success"):
+        if not self.discord_webhook: return
+        colors = {"success": 0x00ff00, "warning": 0xff9900, "error": 0xff0000}
+        embed = {"title": f"🎬 {title}", "description": message, "color": colors.get(color, 0x00ff00),
+                 "timestamp": datetime.utcnow().isoformat(), "footer": {"text": "BladeMedia v2.0"}}
+        try:
+            requests.post(self.discord_webhook, json={"embeds": [embed]}, timeout=10)
+        except: pass
+    
+    def parse_movie_filename(self, filename: str) -> Optional[Tuple[str, int]]:
+        patterns = [r'^(.+?)[. _-]+(?P<year>\d{4})[. _]', r'^(.+?)[. _]*\(?(?P<year>\d{4})\)?[. _]']
+        filename = re.sub(r'[\[\]]', '', filename)
+        for pattern in patterns:
+            m = re.match(pattern, filename, re.IGNORECASE)
+            if m:
+                title = m.group(1).strip('.- ').replace('.', ' ').replace('_', ' ').strip()
+                year = int(m.group('year'))
+                if 1900 <= year <= 2026: return title, year
+        return None
+    
+    def parse_tv_filename(self, filename: str) -> Optional[Tuple[str, int, int, str]]:
+        patterns = [r'^(?P<show>.+?)[. _]+S(?P<season>\d+)[. _]*E(?P<episode>\d+)(?:[._-].*)?(?P<title>.*)?[. _]',
+                    r'^(?P<show>.+?)[. _]+(?P<season>\d+)x(?P<episode>\d+)(?:[._-].*)?(?P<title>.*)?[. _]']
+        filename = re.sub(r'[\[\]]', '', filename)
+        for pattern in patterns:
+            m = re.match(pattern, filename, re.IGNORECASE)
+            if m:
+                show = m.group('show').strip('.- ').replace('.', ' ').replace('_', ' ').strip()
+                season, episode = int(m.group('season')), int(m.group('episode'))
+                title = m.group('title').strip('.- ') or f"Episode {episode}"
+                return show, season, episode, title
+        return None
+    
+    def get_video_files(self, path: Path) -> List[Path]:
+        videos = []
+        for ext in self.video_exts: videos.extend(path.rglob(f'*{ext}'))
+        return sorted(videos)
+    
+    def find_associated_subs(self, video_path: Path) -> List[Path]:
+        subs = []
+        video_name = video_path.stem
+        for ext in self.subtitle_exts: subs.extend(video_path.parent.glob(f'{video_name}*{ext}'))
+        return sorted(subs)
+    
+    def organize_movie(self, video_path: Path):
+        parsed = self.parse_movie_filename(video_path.name)
+        if not parsed: self.summary["movies_skipped"] += 1; return
+        title, year = parsed
+        new_folder = self.movies_root / f"[{title}] [{year}]"
+        if new_folder == video_path.parent: self.summary["movies_skipped"] += 1; return
+        logger.info(f"📽️ [{title}] [{year}] <- {video_path.name}")
+        if not self.dry_run:
+            new_folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_path), str(new_folder / video_path.name))
+            for sub in self.find_associated_subs(video_path):
+                if sub.exists(): shutil.move(str(sub), str(new_folder / sub.name))
+        self.summary["movies_organized"] += 1
+    
+    def organize_tv(self, video_path: Path):
+        parsed = self.parse_tv_filename(video_path.name)
+        if not parsed: self.summary["tv_skipped"] += 1; return
+        show, season, episode, title = parsed
+        show_year = 2025
+        new_show_folder = self.tv_root / f"[{show}] [{show_year}]"
+        new_season_folder = new_show_folder / f"Season {season} [{show_year}]"
+        new_filename = f"EP{episode} - {title} [{show_year}]{video_path.suffix}"
+        if new_season_folder == video_path.parent and video_path.name == new_filename: 
+            self.summary["tv_skipped"] += 1; return
+        logger.info(f"📺 [{show}] S{season:02d}E{episode:02d} <- {video_path.name}")
+        if not self.dry_run:
+            new_season_folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_path), str(new_season_folder / new_filename))
+            for sub in self.find_associated_subs(video_path):
+                if sub.exists(): shutil.move(str(sub), str(new_season_folder / f"{new_filename.rsplit('.',1)[0]}{sub.suffix}"))
+        self.summary["tv_organized"] += 1
+    
+    def run_movies(self):
+        logger.info(f"🎬 Scanning: {self.movies_root}")
+        for video in self.get_video_files(self.movies_root): self.organize_movie(video)
+    
+    def run_tv(self):
+        logger.info(f"📺 Scanning: {self.tv_root}")
+        for video in self.get_video_files(self.tv_root): self.organize_tv(video)
+    
+    def run(self):
+        start_time = datetime.now()
+        self.run_movies()
+        self.run_tv()
+        total = self.summary["movies_organized"] + self.summary["tv_organized"]
+        msg = f"Movies: {self.summary['movies_organized']}/{self.summary['movies_skipped']} | TV: {self.summary['tv_organized']}/{self.summary['tv_skipped']} | {(datetime.now()-start_time).total_seconds():.0f}s"
+        if total > 0: self.send_discord("✅ Organized", msg)
+        else: self.send_discord("ℹ️ No changes", "Nothing to organize")
+        logger.info(f"✅ Complete: {msg}")
+
+def main():
+    import sys
+    parser = argparse.ArgumentParser(description="BladeMedia Organizer")
+    parser.add_argument("root_path", nargs='?', default='.')
+    parser.add_argument("--movies-only", action="store_true")
+    parser.add_argument("--tv-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--discord-webhook")
+    args = parser.parse_args()
+    organizer = MediaOrganizer(args.root_path, args.dry_run, getattr(args, 'discord_webhook', None))
+    if args.tv_only: organizer.run_tv()
+    elif args.movies_only: organizer.run_movies()
+    else: organizer.run()
+
+if __name__ == "__main__": main()
+EOF
+  chmod +x media_organizer.py
+  
+  # === STEP 8: Install Systemd Services ===
+  printf '\n\033[1;34m⚙️  Installing services...\033[0m\n'
+  sudo tee /etc/systemd/system/blademedia.service > /dev/null << EOF
+[Unit]
+Description=BladeMedia Docker Stack
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+WorkingDirectory=${root}
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+RemainAfterExit=yes
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  local organizer_args=""
+  [[ -n "$webhook" ]] && organizer_args="--discord-webhook='$webhook'"
+  
+  sudo tee /etc/systemd/system/blademedia-organizer.service > /dev/null << EOF
+[Unit]
+Description=BladeMedia Media Organizer
+After=blademedia.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${root}
+ExecStart=/usr/bin/python3 ${root}/media_organizer.py . ${organizer_args}
+User=$(id -u)
+Group=$(id -g)
+StandardOutput=append:${root}/organizer.log
+StandardError=append:${root}/organizer.log
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo tee /etc/systemd/system/blademedia-organizer.timer > /dev/null << 'EOF'
+[Unit]
+Description=Run BladeMedia Organizer hourly
+Requires=blademedia-organizer.service
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # === STEP 9: Activate Everything ===
+  sudo systemctl daemon-reload
+  sudo systemctl enable blademedia.service blademedia-organizer.timer
+  sudo systemctl start blademedia.service
+  
+  # === STEP 10: Final Test ===
+  printf '\n\033[1;34m🧪 Starting stack + testing...\033[0m\n'
+  sleep 5  # Let containers start
+  python3 media_organizer.py . --dry-run
+  
+  printf '\n\033[1;32m🎉 BLADEMEDIA COMPLETE INSTALLATION SUCCESSFUL! 🎉\033[0m\n\n'
+  printf '📱 Access URLs (replace %s with your IP):\n' "$(hostname -I | cut -d' ' -f1)"
+  printf '  Jellyfin:      http://%s:8096\n' "$(hostname -I | cut -d' ' -f1)"
+  printf '  MediaManager:  http://%s:8787\n' "$(hostname -I | cut -d' ' -f1)"
+  printf '  Wizarr:        http://%s:5690\n' "$(hostname -I | cut -d' ' -f1)"
+  printf '  Jackett:       http://%s:9117\n' "$(hostname -I | cut -d' ' -f1)"
+  printf '\n📊 Services:\n'
+  sudo systemctl status blademedia.service blademedia-organizer.timer --no-pager
+  printf '\n📋 Logs:\n'
+  printf '  Docker: docker compose logs -f\n'
+  printf '  Organizer: tail -f %s/organizer.log\n' "$root"
+}
+
+main "$@"
