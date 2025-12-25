@@ -152,7 +152,7 @@ services:
     restart: unless-stopped
 
   tdarr:
-    image: ghcr.io/tdarr/tdarr:latest
+    image: ghcr.io/haveagitgat/tdarr:latest
     container_name: blademedia-tdarr
     networks: [media]
     environment:
@@ -174,7 +174,7 @@ services:
     restart: unless-stopped
 
   mediamanager:
-    image: ghcr.io/maxdorninger/mediamanager:latest
+    image: ghcr.io/maxdorninger/mediamanager/mediamanager:latest
     container_name: blademedia-mediamanager
     networks: [media]
     environment:
@@ -187,7 +187,7 @@ services:
     restart: unless-stopped
 
   wizarr:
-    image: ghcr.io/wizarrrr/wizarr:latest
+    image: ghcr.io/wizarrrr/wizarr
     container_name: blademedia-wizarr
     networks: [media]
     environment:
