@@ -18,7 +18,7 @@ Overall, this uses Docker Compose. I have provided two different ways to run thi
 You can run the services easily by just downloading the docker-compose.yml file using wget & filling out all the necessary information for everything to run.
 
 2. Automated installation script.
-In this repository, you can find a bash script. Use wget to get that onto your system, and run the installer. Upon running it, you'll be asked a few questions, aslong as you fill them out correctly, it'll breeze through the entire installation. From making the directories, to creating the compose file & starting the stack. Very straightforward, very simple.
+In this repository, you can find a bash script. Use wget to get that onto your system, run ```chmod +x setup.sh``` and run ```bash setup.sh``` to start the installer. Upon running it, you'll be asked a few questions, aslong as you fill them out correctly, it'll breeze through the entire installation. From making the directories, to creating the compose file & starting the stack. Very straightforward, very simple.
 
 ## Updating
 Updating the stack is simple. All you need to do is this:
