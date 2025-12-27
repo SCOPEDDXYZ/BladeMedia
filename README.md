@@ -85,3 +85,10 @@ This setup installs both a Python script & a Docker Compose file. The Docker Com
   Run `./MediaBlade-AIO-Installer`
 4. Setup the services via WebUI
   From here, you're basically done. 
+
+### AIO Installer options
+When you run the AIO installer, it will prompt you for:
+- **Security mode**: run containers as root *or* as a specific UID/GID
+- **Networking**: bind ports to localhost, LAN, or all interfaces
+- **Reverse proxy**: enable/disable Traefik + optional auto-start + hostnames + Let's Encrypt email
+- **Tdarr GPU**: none / NVIDIA / VAAPI (writes an override compose file when needed)

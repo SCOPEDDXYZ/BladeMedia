@@ -10,6 +10,64 @@ print_banner() {
   printf '\033[0m\n'
 }
 
+prompt() {
+  # prompt "Question" "default" -> echoes answer
+  local q="$1"
+  local def="${2:-}"
+  local ans=""
+  if [[ -n "$def" ]]; then
+    read -rp "${q} [${def}]: " ans
+    ans="${ans:-$def}"
+  else
+    read -rp "${q}: " ans
+  fi
+  printf '%s' "$ans"
+}
+
+prompt_yes_no() {
+  # prompt_yes_no "Question" "y|n" -> echoes y|n
+  local q="$1"
+  local def="${2:-n}"
+  local ans=""
+  while true; do
+    if [[ "$def" == "y" ]]; then
+      read -rp "${q} [Y/n]: " ans
+      ans="${ans:-y}"
+    else
+      read -rp "${q} [y/N]: " ans
+      ans="${ans:-n}"
+    fi
+    ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+    case "$ans" in
+      y|yes) printf 'y'; return 0 ;;
+      n|no)  printf 'n'; return 0 ;;
+    esac
+  done
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+detect_target_user() {
+  # Prefer the invoking user when running via sudo.
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    printf '%s' "${SUDO_USER}"
+  else
+    printf '%s' "$(id -un)"
+  fi
+}
+
+safe_id_u() {
+  local u="$1"
+  id -u "$u" 2>/dev/null || echo "1000"
+}
+
+safe_id_g() {
+  local u="$1"
+  id -g "$u" 2>/dev/null || echo "1000"
+}
+
 main() {
   print_banner
 
@@ -30,6 +88,156 @@ main() {
   local WEBHOOK
   read -rp "Discord webhook URL (press Enter to skip): " WEBHOOK
   WEBHOOK="${WEBHOOK:-}"
+
+  # === STEP 2b: Configuration wizard ===
+  echo
+  echo "=== Configuration Wizard ==="
+
+  local PROFILE
+  echo "Choose an install profile:"
+  echo "  1) Secure (recommended): non-root, localhost bind, proxy optional"
+  echo "  2) Quick/Exposed: run as root, bind to 0.0.0.0 (NOT recommended)"
+  echo "  3) Custom: choose every option"
+  PROFILE="$(prompt "Select [1/2/3]" "1")"
+  case "$PROFILE" in
+    1|2|3) : ;;
+    *) PROFILE="1" ;;
+  esac
+
+  local TZ_VALUE="Etc/UTC"
+  if [[ -f /etc/timezone ]]; then
+    TZ_VALUE="$(tr -d '\n' < /etc/timezone || echo 'Etc/UTC')"
+  fi
+
+  local TARGET_USER TARGET_UID TARGET_GID
+  TARGET_USER="$(detect_target_user)"
+  TARGET_UID="$(safe_id_u "$TARGET_USER")"
+  TARGET_GID="$(safe_id_g "$TARGET_USER")"
+
+  local RUN_AS_ROOT="n"
+  local BIND_IP="127.0.0.1"
+  local ENABLE_PROXY="n"
+  local START_PROXY_WITH_STACK="n"
+  local TRAEFIK_BIND_IP="0.0.0.0"
+  local LETSENCRYPT_EMAIL="you@example.com"
+  local JELLYFIN_HOST="jellyfin.example.com"
+  local MEDIAMANAGER_HOST="mediamanager.example.com"
+  local WIZARR_HOST="wizarr.example.com"
+  local TDARR_NVIDIA_GPUS="0"
+  local ENABLE_VAAPI="n"
+  local RENDER_GID="0"
+
+  if [[ "$PROFILE" == "2" ]]; then
+    RUN_AS_ROOT="y"
+    BIND_IP="0.0.0.0"
+  fi
+
+  if [[ "$PROFILE" != "2" ]]; then
+    TZ_VALUE="$(prompt "Timezone" "$TZ_VALUE")"
+  fi
+
+  if [[ "$PROFILE" == "3" ]]; then
+    RUN_AS_ROOT="$(prompt_yes_no "Run containers as root (UID/GID 0)?" "n")"
+  fi
+
+  if [[ "$PROFILE" == "1" ]]; then
+    RUN_AS_ROOT="$(prompt_yes_no "Run containers as root? (recommended: No)" "n")"
+  fi
+
+  if [[ "$PROFILE" == "2" ]]; then
+    RUN_AS_ROOT="y"
+  fi
+
+  local MEDIABLADE_UID MEDIABLADE_GID
+  if [[ "$RUN_AS_ROOT" == "y" ]]; then
+    MEDIABLADE_UID="0"
+    MEDIABLADE_GID="0"
+  else
+    if [[ "$PROFILE" == "3" ]]; then
+      MEDIABLADE_UID="$(prompt "PUID to run containers as" "$TARGET_UID")"
+      MEDIABLADE_GID="$(prompt "PGID to run containers as" "$TARGET_GID")"
+      if ! is_uint "$MEDIABLADE_UID"; then MEDIABLADE_UID="$TARGET_UID"; fi
+      if ! is_uint "$MEDIABLADE_GID"; then MEDIABLADE_GID="$TARGET_GID"; fi
+    else
+      MEDIABLADE_UID="$TARGET_UID"
+      MEDIABLADE_GID="$TARGET_GID"
+    fi
+  fi
+
+  if [[ "$PROFILE" == "3" ]]; then
+    echo
+    echo "Bind mode for published ports:"
+    echo "  1) Localhost only (127.0.0.1) [recommended]"
+    echo "  2) All interfaces (0.0.0.0)   [exposed]"
+    echo "  3) Custom IP"
+    local BIND_MODE
+    BIND_MODE="$(prompt "Select [1/2/3]" "1")"
+    case "$BIND_MODE" in
+      1) BIND_IP="127.0.0.1" ;;
+      2) BIND_IP="0.0.0.0" ;;
+      3) BIND_IP="$(prompt "Enter bind IP" "0.0.0.0")" ;;
+      *) BIND_IP="127.0.0.1" ;;
+    esac
+  fi
+
+  if [[ "$PROFILE" == "1" ]]; then
+    local EXPOSE_LAN
+    EXPOSE_LAN="$(prompt_yes_no "Expose UIs to LAN/Internet (bind 0.0.0.0)?" "n")"
+    if [[ "$EXPOSE_LAN" == "y" ]]; then
+      BIND_IP="0.0.0.0"
+    else
+      BIND_IP="127.0.0.1"
+    fi
+  fi
+
+  if [[ "$PROFILE" == "2" ]]; then
+    BIND_IP="0.0.0.0"
+  fi
+
+  echo
+  ENABLE_PROXY="$(prompt_yes_no "Enable built-in Traefik reverse proxy (optional)?" "n")"
+  if [[ "$ENABLE_PROXY" == "y" ]]; then
+    START_PROXY_WITH_STACK="$(prompt_yes_no "Start proxy automatically with the stack (recommended)?" "y")"
+    TRAEFIK_BIND_IP="$(prompt "Traefik bind IP (80/443)" "$TRAEFIK_BIND_IP")"
+    LETSENCRYPT_EMAIL="$(prompt "Let's Encrypt email" "$LETSENCRYPT_EMAIL")"
+    JELLYFIN_HOST="$(prompt "Jellyfin hostname" "$JELLYFIN_HOST")"
+    MEDIAMANAGER_HOST="$(prompt "MediaManager hostname" "$MEDIAMANAGER_HOST")"
+    WIZARR_HOST="$(prompt "Wizarr hostname" "$WIZARR_HOST")"
+  fi
+
+  echo
+  echo "Tdarr hardware acceleration:"
+  echo "  1) None"
+  echo "  2) NVIDIA (requires NVIDIA Container Toolkit on host)"
+  echo "  3) Intel/AMD VAAPI (/dev/dri) (requires /dev/dri on host)"
+  local GPU_MODE
+  GPU_MODE="$(prompt "Select [1/2/3]" "1")"
+  case "$GPU_MODE" in
+    2)
+      TDARR_NVIDIA_GPUS="$(prompt "NVIDIA GPUs (0, 1, 2, or 'all')" "all")"
+      ENABLE_VAAPI="n"
+      ;;
+    3)
+      ENABLE_VAAPI="y"
+      TDARR_NVIDIA_GPUS="0"
+      RENDER_GID="$(prompt "Render group id (RENDER_GID) (often 109)" "0")"
+      if ! is_uint "$RENDER_GID"; then RENDER_GID="0"; fi
+      ;;
+    *)
+      TDARR_NVIDIA_GPUS="0"
+      ENABLE_VAAPI="n"
+      ;;
+  esac
+
+  echo
+  echo "=== Summary ==="
+  echo "Root:            $ROOT"
+  echo "Timezone:        $TZ_VALUE"
+  echo "Run as root:     $RUN_AS_ROOT (UID=$MEDIABLADE_UID GID=$MEDIABLADE_GID)"
+  echo "Bind IP:         $BIND_IP"
+  echo "Traefik enabled: $ENABLE_PROXY (auto-start: $START_PROXY_WITH_STACK)"
+  echo "Tdarr NVIDIA:    $TDARR_NVIDIA_GPUS"
+  echo "Tdarr VAAPI:     $ENABLE_VAAPI"
 
   # === STEP 3: Install Docker (if needed) ===
   echo
@@ -56,31 +264,54 @@ main() {
     "$ROOT/tdarr_cache" \
     "$ROOT/traefik/letsencrypt"
 
-  # Write a .env with safer defaults (and correct UID/GID)
-  if [[ ! -f "$ROOT/.env" ]]; then
-    local TZ_VALUE="Etc/UTC"
-    if [[ -f /etc/timezone ]]; then
-      TZ_VALUE="$(tr -d '\n' < /etc/timezone || echo 'Etc/UTC')"
+  # Apply ownership for non-root container mode (best-effort)
+  if [[ "$RUN_AS_ROOT" != "y" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      chown -R "${MEDIABLADE_UID}:${MEDIABLADE_GID}" \
+        "$ROOT/media" \
+        "$ROOT/downloads" \
+        "$ROOT/tdarr_cache" \
+        "$ROOT/traefik" \
+        || true
+    else
+      echo "Note: not running as root; skipping chown of $ROOT directories."
     fi
-
-    cat > "$ROOT/.env" << EOF
-# MediaBlade generated defaults (edit as needed)
-BIND_IP=127.0.0.1
-TZ=${TZ_VALUE}
-MEDIABLADE_UID=$(id -u)
-MEDIABLADE_GID=$(id -g)
-
-# Optional: Traefik reverse proxy
-TRAEFIK_ENABLE=false
-LETSENCRYPT_EMAIL=you@example.com
-JELLYFIN_HOST=jellyfin.example.com
-MEDIAMANAGER_HOST=mediamanager.example.com
-WIZARR_HOST=wizarr.example.com
-
-# Optional: Tdarr NVIDIA GPU
-TDARR_NVIDIA_GPUS=0
-EOF
   fi
+
+  # Write .env from chosen options (overwrites existing for reproducibility)
+  local COMPOSE_PROFILES_LINE=""
+  if [[ "$ENABLE_PROXY" == "y" && "$START_PROXY_WITH_STACK" == "y" ]]; then
+    COMPOSE_PROFILES_LINE="COMPOSE_PROFILES=proxy"
+  fi
+  cat > "$ROOT/.env" << EOF
+# MediaBlade generated configuration
+TZ=${TZ_VALUE}
+BIND_IP=${BIND_IP}
+MEDIABLADE_UID=${MEDIABLADE_UID}
+MEDIABLADE_GID=${MEDIABLADE_GID}
+LOG_MAX_SIZE=10m
+LOG_MAX_FILE=3
+${COMPOSE_PROFILES_LINE}
+
+# Traefik reverse proxy (optional)
+TRAEFIK_ENABLE=$([[ "$ENABLE_PROXY" == "y" ]] && echo "true" || echo "false")
+TRAEFIK_BIND_IP=${TRAEFIK_BIND_IP}
+TRAEFIK_ENTRYPOINTS=websecure
+TRAEFIK_TLS=true
+TRAEFIK_CERTRESOLVER=le
+TRAEFIK_LOG_LEVEL=INFO
+TRAEFIK_DASHBOARD=false
+LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+JELLYFIN_HOST=${JELLYFIN_HOST}
+MEDIAMANAGER_HOST=${MEDIAMANAGER_HOST}
+WIZARR_HOST=${WIZARR_HOST}
+
+# Tdarr GPU options
+TDARR_NVIDIA_GPUS=${TDARR_NVIDIA_GPUS}
+NVIDIA_VISIBLE_DEVICES=
+NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+RENDER_GID=${RENDER_GID}
+EOF
 
   # === STEP 5: Generate docker-compose.yml ===
   echo
@@ -296,6 +527,22 @@ services:
       - "traefik.http.services.wizarr.loadbalancer.server.port=5690"
     <<: *default-security
 EOF
+
+  # Optional VAAPI override
+  local COMPOSE_FILE_ARGS="-f docker-compose.yml"
+  if [[ "$ENABLE_VAAPI" == "y" ]]; then
+    echo
+    echo "=== Writing docker-compose.vaapi.yml (Tdarr VAAPI) ==="
+    cat > "$ROOT/docker-compose.vaapi.yml" << 'EOF'
+services:
+  tdarr:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-0}"
+EOF
+    COMPOSE_FILE_ARGS="-f docker-compose.yml -f docker-compose.vaapi.yml"
+  fi
 
   # === STEP 6: Install Python + requests via apt (24.04-safe) ===
   echo
@@ -570,8 +817,8 @@ Requires=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=${ROOT}
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
+ExecStart=/usr/bin/docker compose ${COMPOSE_FILE_ARGS} up -d
+ExecStop=/usr/bin/docker compose ${COMPOSE_FILE_ARGS} down
 RemainAfterExit=yes
 
 [Install]
@@ -636,15 +883,23 @@ EOF
   echo " MediaBlade installation complete!"
   echo " Stack root: $ROOT"
   echo "----------------------------------------------"
-  echo "By default, ports are bound to localhost."
-  echo "If you're using a reverse proxy, enable it with:"
-  echo "  docker compose --profile proxy up -d"
+  echo "Bind IP: ${BIND_IP}"
+  if [[ "$ENABLE_PROXY" == "y" ]]; then
+    echo "Reverse proxy: enabled (Traefik)"
+    echo "  Jellyfin host:     ${JELLYFIN_HOST}"
+    echo "  MediaManager host: ${MEDIAMANAGER_HOST}"
+    echo "  Wizarr host:       ${WIZARR_HOST}"
+    echo "  Note: if you did NOT auto-start the proxy, run:"
+    echo "    docker compose --profile proxy up -d"
+  else
+    echo "Reverse proxy: disabled"
+  fi
   echo
-  echo "Local URLs (on the host):"
-  echo "Jellyfin:      http://127.0.0.1:8096"
-  echo "MediaManager:  http://127.0.0.1:8787"
-  echo "Wizarr:        http://127.0.0.1:5690"
-  echo "Jackett:       http://127.0.0.1:9117"
+  echo "Service ports:"
+  echo "  Jellyfin:     http://${BIND_IP}:8096"
+  echo "  MediaManager: http://${BIND_IP}:8787"
+  echo "  Wizarr:       http://${BIND_IP}:5690"
+  echo "  Jackett:      http://${BIND_IP}:9117"
   echo
   echo "Check services:"
   echo "  systemctl status mediablade.service"
