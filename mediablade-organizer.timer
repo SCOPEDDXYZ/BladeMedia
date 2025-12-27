@@ -1,6 +1,6 @@
 [Unit]
 Description=Run MediaBlade Organizer hourly
-Requires=blademedia-organizer.service
+Requires=mediablade-organizer.service
 
 [Timer]
 OnCalendar=hourly
@@ -9,3 +9,4 @@ RandomizedDelaySec=300
 
 [Install]
 WantedBy=timers.target
+

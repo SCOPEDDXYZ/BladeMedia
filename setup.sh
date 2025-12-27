@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Media stack setup ==="
-read -rp "Enter root path for media stack (e.g. /srv/media-stack): " ROOT
+echo "=== MediaBlade stack setup ==="
+read -rp "Enter root path for MediaBlade (e.g. /srv/mediablade): " ROOT
 
 if [ -z "$ROOT" ]; then
   echo "Root path cannot be empty."
   exit 1
 fi
 
-echo "Using root: $ROOT"
+echo "Using MediaBlade root: $ROOT"
 
 # Create directory structure
 echo "Creating directory tree..."
@@ -29,7 +29,7 @@ COMPOSE_FILE="$ROOT/docker-compose.yml"
 echo "Writing docker-compose.yml to $COMPOSE_FILE ..."
 
 cat > "$COMPOSE_FILE" <<EOF
-version: "3.9"
+name: mediablade
 
 networks:
   media:
@@ -51,91 +51,91 @@ services:
 
   jellyfin:
     image: jellyfin/jellyfin:latest
-    container_name: jellyfin
+    container_name: mediablade-jellyfin
     networks:
       - media
-    user: "0:0"
+    user: "\${MEDIABLADE_UID:-0}:\${MEDIABLADE_GID:-0}"
     environment:
-      - TZ=Etc/UTC
+      - TZ=\${TZ:-Etc/UTC}
     volumes:
       - jellyfin_config:/config
       - jellyfin_cache:/cache
       - ${ROOT}/media:/media
     ports:
-      - "8096:8096"
+      - "\${BIND_IP:-0.0.0.0}:8096:8096"
     restart: unless-stopped
 
   jackett:
     image: lscr.io/linuxserver/jackett:latest
-    container_name: jackett
+    container_name: mediablade-jackett
     networks:
       - media
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=\${MEDIABLADE_UID:-0}
+      - PGID=\${MEDIABLADE_GID:-0}
+      - TZ=\${TZ:-Etc/UTC}
     volumes:
       - jackett_config:/config
       - ${ROOT}/downloads/jackett:/downloads
     ports:
-      - "9117:9117"
+      - "\${BIND_IP:-0.0.0.0}:9117:9117"
     restart: unless-stopped
 
   rdtclient:
     image: rogerfar/rdtclient:latest
-    container_name: rdtclient
+    container_name: mediablade-rdtclient
     networks:
       - media
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=\${MEDIABLADE_UID:-0}
+      - PGID=\${MEDIABLADE_GID:-0}
+      - TZ=\${TZ:-Etc/UTC}
     volumes:
       - rdtclient_config:/data/db
       - ${ROOT}/downloads:/data/downloads
     ports:
-      - "6500:6500"
+      - "\${BIND_IP:-0.0.0.0}:6500:6500"
     restart: unless-stopped
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
+    container_name: mediablade-flaresolverr
     networks:
       - media
     environment:
       - LOG_LEVEL=info
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
-      - TZ=Etc/UTC
+      - TZ=\${TZ:-Etc/UTC}
     ports:
-      - "8191:8191"
+      - "\${BIND_IP:-0.0.0.0}:8191:8191"
     restart: unless-stopped
 
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
-    container_name: bazarr
+    container_name: mediablade-bazarr
     networks:
       - media
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=\${MEDIABLADE_UID:-0}
+      - PGID=\${MEDIABLADE_GID:-0}
+      - TZ=\${TZ:-Etc/UTC}
     volumes:
       - bazarr_config:/config
       - ${ROOT}/media:/media
     ports:
-      - "6767:6767"
+      - "\${BIND_IP:-0.0.0.0}:6767:6767"
     restart: unless-stopped
 
   tdarr:
-    image: ghcr.io/tdarr/tdarr:latest
-    container_name: tdarr
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: mediablade-tdarr
     networks:
       - media
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=\${MEDIABLADE_UID:-0}
+      - PGID=\${MEDIABLADE_GID:-0}
+      - TZ=\${TZ:-Etc/UTC}
       - serverIP=0.0.0.0
       - serverPort=8266
       - webUIPort=8265
@@ -146,32 +146,32 @@ services:
       - ${ROOT}/media:/media
       - ${ROOT}/tdarr_cache:/temp
     ports:
-      - "8265:8265"
-      - "8266:8266"
+      - "\${BIND_IP:-0.0.0.0}:8265:8265"
+      - "\${BIND_IP:-0.0.0.0}:8266:8266"
     restart: unless-stopped
 
   mediamanager:
-    image: ghcr.io/maxdorninger/mediamanager:latest
-    container_name: mediamanager
+    image: ghcr.io/maxdorninger/mediamanager/mediamanager:latest
+    container_name: mediablade-mediamanager
     networks:
       - media
     environment:
-      - TZ=Etc/UTC
+      - TZ=\${TZ:-Etc/UTC}
       # Add any DB or auth-related environment variables you want here.
     volumes:
       - mediamanager_config:/app/data
       - ${ROOT}/media:/media
     ports:
-      - "8787:8787"
+      - "\${BIND_IP:-0.0.0.0}:8787:8787"
     restart: unless-stopped
 
   wizarr:
     image: ghcr.io/wizarrrr/wizarr:latest
-    container_name: wizarr
+    container_name: mediablade-wizarr
     networks:
       - media
     environment:
-      - TZ=Etc/UTC
+      - TZ=\${TZ:-Etc/UTC}
       # Example (override in compose if you want):
       # - APP_URL=https://your-domain
       # - INVITE_ONLY=true
@@ -179,7 +179,7 @@ services:
     volumes:
       - wizarr_config:/data
     ports:
-      - "5690:5690"
+      - "\${BIND_IP:-0.0.0.0}:5690:5690"
     restart: unless-stopped
 EOF
 
