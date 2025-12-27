@@ -1,69 +1,24 @@
-#!/usr/bin/env bash
-set -euo pipefail  # Exit on error, undefined vars, pipe failures
+name: mediablade
 
-readonly SCRIPT_NAME="BladeMedia Setup"
-readonly DIRS=(
-  'media/movies'
-  'media/tv'
-  'downloads/incomplete'
-  'downloads/complete'
-  'downloads/jackett'
-  'tdarr_cache'
-)
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILE:-3}"
 
-print_banner() {
-  printf '\n\033[1;36m%s\033[0m\n' "========================================"
-  printf '%s\n'     "$SCRIPT_NAME v1.0"
-  printf '\033[1;36m%s\033[0m\n' "========================================"
-}
-
-print_next_steps() {
-  local root="$1"
-  printf '\n\033[1;32mNext Steps:\033[0m\n'
-  printf '  cd %s\n' "$root"
-  printf '  docker compose up -d\n\n'
-  printf '\033[1;33mAccess via browser (replace SERVER_IP):\033[0m\n'
-  printf '  Jellyfin:     http://SERVER_IP:8096\n'
-  printf '  MediaManager: http://SERVER_IP:8787\n'
-  printf '  Wizarr:       http://SERVER_IP:5690\n'
-}
-
-main() {
-  print_banner
-  
-  local root
-  read -rp $'\033[1;33mEnter root path (e.g. /srv/blademedia): \033[0m' root
-  
-  if [[ -z "$root" ]]; then
-    printf '\033[1;31mError: Root path cannot be empty.\033[0m\n' >&2
-    exit 1
-  fi
-
-  if [[ ! "$root" =~ ^/ ]]; then
-    printf '\033[1;31mError: %s must be absolute path\033[0m\n' "$root" >&2
-    exit 1
-  fi
-
-  printf '\n\033[1;32mUsing root: %s\033[0m\n' "$root"
-
-  # Create all dirs in single brace expansion (fastest)
-  printf 'Creating BladeMedia directory structure...\n'
-  local full_paths=()
-  for dir in "${DIRS[@]}"; do
-    full_paths+=("$root/$dir")
-  done
-  mkdir -p "${full_paths[@]}"
-  printf '✅ %d directories created\n' "${#full_paths[@]}"
-
-  local compose_file="$root/docker-compose.yml"
-  printf 'Writing %s...\n' "$compose_file"
-
-  # Generate docker-compose.yml with clean variable substitution
-  cat > "$compose_file" <<EOF
-version: "3.9"
+x-security: &default-security
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  logging: *default-logging
 
 networks:
   media:
+    driver: bridge
+  proxy:
     driver: bridge
 
 volumes:
@@ -79,119 +34,186 @@ volumes:
   wizarr_config:
 
 services:
+  # Optional reverse proxy (Traefik v3).
+  # Enable with: docker compose --profile proxy up -d
+  # Requires setting LETSENCRYPT_EMAIL + your *HOST variables in .env.
+  traefik:
+    image: traefik:v3.3
+    profiles: ["proxy"]
+    container_name: mediablade-traefik
+    networks: [proxy]
+    ports:
+      - "${TRAEFIK_BIND_IP:-0.0.0.0}:80:80"
+      - "${TRAEFIK_BIND_IP:-0.0.0.0}:443:443"
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.tlschallenge=true"
+      - "--api.dashboard=${TRAEFIK_DASHBOARD:-false}"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/letsencrypt:/letsencrypt
+    <<: *default-security
+
   jellyfin:
     image: jellyfin/jellyfin:latest
-    container_name: blademedia-jellyfin
-    networks: [media]
-    user: "0:0"
-    environment: [TZ=Etc/UTC]
+    container_name: mediablade-jellyfin
+    networks: [media, proxy]
+    user: "${MEDIABLADE_UID:-1000}:${MEDIABLADE_GID:-1000}"
+    environment:
+      - TZ=${TZ:-Etc/UTC}
     volumes:
       - jellyfin_config:/config
       - jellyfin_cache:/cache
-      - ${root}/media:/media
-    ports: ["8096:8096"]
-    restart: unless-stopped
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8096:8096"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.jellyfin.rule=Host(`${JELLYFIN_HOST:-jellyfin.local}`)"
+      - "traefik.http.routers.jellyfin.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.jellyfin.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.jellyfin.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.jellyfin.loadbalancer.server.port=8096"
+    <<: *default-security
 
   jackett:
     image: lscr.io/linuxserver/jackett:latest
-    container_name: blademedia-jackett
+    container_name: mediablade-jackett
     networks: [media]
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
     volumes:
       - jackett_config:/config
-      - ${root}/downloads/jackett:/downloads
-    ports: ["9117:9117"]
-    restart: unless-stopped
+      - ./downloads/jackett:/downloads
+    ports:
+      - "${BIND_IP:-127.0.0.1}:9117:9117"
+    <<: *default-security
 
   rdtclient:
     image: rogerfar/rdtclient:latest
-    container_name: blademedia-rdtclient
+    container_name: mediablade-rdtclient
     networks: [media]
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
     volumes:
       - rdtclient_config:/data/db
-      - ${root}/downloads:/data/downloads
-    ports: ["6500:6500"]
-    restart: unless-stopped
+      - ./downloads:/data/downloads
+    ports:
+      - "${BIND_IP:-127.0.0.1}:6500:6500"
+    <<: *default-security
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: blademedia-flaresolverr
+    container_name: mediablade-flaresolverr
     networks: [media]
     environment:
       - LOG_LEVEL=info
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
-      - TZ=Etc/UTC
-    ports: ["8191:8191"]
-    restart: unless-stopped
+      - TZ=${TZ:-Etc/UTC}
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8191:8191"
+    <<: *default-security
 
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
-    container_name: blademedia-bazarr
+    container_name: mediablade-bazarr
     networks: [media]
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
     volumes:
       - bazarr_config:/config
-      - ${root}/media:/media
-    ports: ["6767:6767"]
-    restart: unless-stopped
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:6767:6767"
+    <<: *default-security
 
   tdarr:
-    image: ghcr.io/tdarr/tdarr:latest
-    container_name: blademedia-tdarr
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: mediablade-tdarr
     networks: [media]
     environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Etc/UTC
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
       - serverIP=0.0.0.0
       - serverPort=8266
       - webUIPort=8265
+      # NVIDIA support (optional): install NVIDIA Container Toolkit on the host.
+      # If you have GPUs, set TDARR_NVIDIA_GPUS=all (or 1) in .env
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,video,utility}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-}
     volumes:
       - tdarr_config:/app/configs
       - tdarr_logs:/app/logs
       - tdarr_server_config:/app/server
-      - ${root}/media:/media
-      - ${root}/tdarr_cache:/temp
+      - ./media:/media
+      - ./tdarr_cache:/temp
+    device_requests:
+      - driver: nvidia
+        count: ${TDARR_NVIDIA_GPUS:-0}
+        capabilities: [gpu]
+    # Intel/AMD (VAAPI / QuickSync) option (uncomment if your host has /dev/dri):
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "${RENDER_GID:-0}"
     ports:
-      - "8265:8265"
-      - "8266:8266"
-    restart: unless-stopped
+      - "${BIND_IP:-127.0.0.1}:8265:8265"
+      - "${BIND_IP:-127.0.0.1}:8266:8266"
+    <<: *default-security
 
   mediamanager:
-    image: ghcr.io/maxdorninger/mediamanager:latest
-    container_name: blademedia-mediamanager
-    networks: [media]
-    environment: [TZ=Etc/UTC]
+    image: ghcr.io/maxdorninger/mediamanager/mediamanager:latest
+    container_name: mediablade-mediamanager
+    networks: [media, proxy]
+    environment:
+      - TZ=${TZ:-Etc/UTC}
     volumes:
       - mediamanager_config:/app/data
-      - ${root}/media:/media
-    ports: ["8787:8787"]
-    restart: unless-stopped
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8787:8787"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.mediamanager.rule=Host(`${MEDIAMANAGER_HOST:-mediamanager.local}`)"
+      - "traefik.http.routers.mediamanager.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.mediamanager.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.mediamanager.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.mediamanager.loadbalancer.server.port=8787"
+    <<: *default-security
 
   wizarr:
     image: ghcr.io/wizarrrr/wizarr:latest
-    container_name: blademedia-wizarr
-    networks: [media]
-    environment: [TZ=Etc/UTC]
-    volumes: [wizarr_config:/data]
-    ports: ["5690:5690"]
-    restart: unless-stopped
-EOF
-
-  printf '✅ BladeMedia docker-compose.yml created\n'
-  print_next_steps "$root"
-  printf '\n\033[1;36mBladeMedia setup complete! 🎬\033[0m\n'
-}
-
-main
+    container_name: mediablade-wizarr
+    networks: [media, proxy]
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - wizarr_config:/data
+    ports:
+      - "${BIND_IP:-127.0.0.1}:5690:5690"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.wizarr.rule=Host(`${WIZARR_HOST:-wizarr.local}`)"
+      - "traefik.http.routers.wizarr.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.wizarr.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.wizarr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.wizarr.loadbalancer.server.port=5690"
+    <<: *default-security

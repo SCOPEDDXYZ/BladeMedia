@@ -1,0 +1,915 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+print_banner() {
+  printf '\n\033[1;36m'
+  printf '==============================================\n'
+  printf '        MediaBlade COMPLETE Setup  v3.0       \n'
+  printf '   Docker Stack + Auto-Organizer Service      \n'
+  printf '==============================================\n'
+  printf '\033[0m\n'
+}
+
+prompt() {
+  # prompt "Question" "default" -> echoes answer
+  local q="$1"
+  local def="${2:-}"
+  local ans=""
+  if [[ -n "$def" ]]; then
+    read -rp "${q} [${def}]: " ans
+    ans="${ans:-$def}"
+  else
+    read -rp "${q}: " ans
+  fi
+  printf '%s' "$ans"
+}
+
+prompt_yes_no() {
+  # prompt_yes_no "Question" "y|n" -> echoes y|n
+  local q="$1"
+  local def="${2:-n}"
+  local ans=""
+  while true; do
+    if [[ "$def" == "y" ]]; then
+      read -rp "${q} [Y/n]: " ans
+      ans="${ans:-y}"
+    else
+      read -rp "${q} [y/N]: " ans
+      ans="${ans:-n}"
+    fi
+    ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+    case "$ans" in
+      y|yes) printf 'y'; return 0 ;;
+      n|no)  printf 'n'; return 0 ;;
+    esac
+  done
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+detect_target_user() {
+  # Prefer the invoking user when running via sudo.
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    printf '%s' "${SUDO_USER}"
+  else
+    printf '%s' "$(id -un)"
+  fi
+}
+
+safe_id_u() {
+  local u="$1"
+  id -u "$u" 2>/dev/null || echo "1000"
+}
+
+safe_id_g() {
+  local u="$1"
+  id -g "$u" 2>/dev/null || echo "1000"
+}
+
+main() {
+  print_banner
+
+  # === STEP 1: Ask for MediaBlade root ===
+  local ROOT
+  read -rp "Enter MediaBlade root (e.g. /srv/mediablade): " ROOT
+
+  if [[ -z "$ROOT" || "$ROOT" != /* ]]; then
+    echo "Error: Root must be an absolute path (start with /)" >&2
+    exit 1
+  fi
+
+  mkdir -p "$ROOT"
+  cd "$ROOT"
+  echo "Using MediaBlade root: $ROOT"
+
+  # === STEP 2: Optional Discord webhook ===
+  local WEBHOOK
+  read -rp "Discord webhook URL (press Enter to skip): " WEBHOOK
+  WEBHOOK="${WEBHOOK:-}"
+
+  # === STEP 2b: Configuration wizard ===
+  echo
+  echo "=== Configuration Wizard ==="
+
+  local PROFILE
+  echo "Choose an install profile:"
+  echo "  1) Secure (recommended): non-root, localhost bind, proxy optional"
+  echo "  2) Quick/Exposed: run as root, bind to 0.0.0.0 (NOT recommended)"
+  echo "  3) Custom: choose every option"
+  PROFILE="$(prompt "Select [1/2/3]" "1")"
+  case "$PROFILE" in
+    1|2|3) : ;;
+    *) PROFILE="1" ;;
+  esac
+
+  local TZ_VALUE="Etc/UTC"
+  if [[ -f /etc/timezone ]]; then
+    TZ_VALUE="$(tr -d '\n' < /etc/timezone || echo 'Etc/UTC')"
+  fi
+
+  local TARGET_USER TARGET_UID TARGET_GID
+  TARGET_USER="$(detect_target_user)"
+  TARGET_UID="$(safe_id_u "$TARGET_USER")"
+  TARGET_GID="$(safe_id_g "$TARGET_USER")"
+
+  local RUN_AS_ROOT="n"
+  local BIND_IP="127.0.0.1"
+  local ENABLE_PROXY="n"
+  local START_PROXY_WITH_STACK="n"
+  local TRAEFIK_BIND_IP="0.0.0.0"
+  local LETSENCRYPT_EMAIL="you@example.com"
+  local JELLYFIN_HOST="jellyfin.example.com"
+  local MEDIAMANAGER_HOST="mediamanager.example.com"
+  local WIZARR_HOST="wizarr.example.com"
+  local TDARR_NVIDIA_GPUS="0"
+  local ENABLE_VAAPI="n"
+  local RENDER_GID="0"
+
+  if [[ "$PROFILE" == "2" ]]; then
+    RUN_AS_ROOT="y"
+    BIND_IP="0.0.0.0"
+  fi
+
+  if [[ "$PROFILE" != "2" ]]; then
+    TZ_VALUE="$(prompt "Timezone" "$TZ_VALUE")"
+  fi
+
+  if [[ "$PROFILE" == "3" ]]; then
+    RUN_AS_ROOT="$(prompt_yes_no "Run containers as root (UID/GID 0)?" "n")"
+  fi
+
+  if [[ "$PROFILE" == "1" ]]; then
+    RUN_AS_ROOT="$(prompt_yes_no "Run containers as root? (recommended: No)" "n")"
+  fi
+
+  if [[ "$PROFILE" == "2" ]]; then
+    RUN_AS_ROOT="y"
+  fi
+
+  local MEDIABLADE_UID MEDIABLADE_GID
+  if [[ "$RUN_AS_ROOT" == "y" ]]; then
+    MEDIABLADE_UID="0"
+    MEDIABLADE_GID="0"
+  else
+    if [[ "$PROFILE" == "3" ]]; then
+      MEDIABLADE_UID="$(prompt "PUID to run containers as" "$TARGET_UID")"
+      MEDIABLADE_GID="$(prompt "PGID to run containers as" "$TARGET_GID")"
+      if ! is_uint "$MEDIABLADE_UID"; then MEDIABLADE_UID="$TARGET_UID"; fi
+      if ! is_uint "$MEDIABLADE_GID"; then MEDIABLADE_GID="$TARGET_GID"; fi
+    else
+      MEDIABLADE_UID="$TARGET_UID"
+      MEDIABLADE_GID="$TARGET_GID"
+    fi
+  fi
+
+  if [[ "$PROFILE" == "3" ]]; then
+    echo
+    echo "Bind mode for published ports:"
+    echo "  1) Localhost only (127.0.0.1) [recommended]"
+    echo "  2) All interfaces (0.0.0.0)   [exposed]"
+    echo "  3) Custom IP"
+    local BIND_MODE
+    BIND_MODE="$(prompt "Select [1/2/3]" "1")"
+    case "$BIND_MODE" in
+      1) BIND_IP="127.0.0.1" ;;
+      2) BIND_IP="0.0.0.0" ;;
+      3) BIND_IP="$(prompt "Enter bind IP" "0.0.0.0")" ;;
+      *) BIND_IP="127.0.0.1" ;;
+    esac
+  fi
+
+  if [[ "$PROFILE" == "1" ]]; then
+    local EXPOSE_LAN
+    EXPOSE_LAN="$(prompt_yes_no "Expose UIs to LAN/Internet (bind 0.0.0.0)?" "n")"
+    if [[ "$EXPOSE_LAN" == "y" ]]; then
+      BIND_IP="0.0.0.0"
+    else
+      BIND_IP="127.0.0.1"
+    fi
+  fi
+
+  if [[ "$PROFILE" == "2" ]]; then
+    BIND_IP="0.0.0.0"
+  fi
+
+  echo
+  ENABLE_PROXY="$(prompt_yes_no "Enable built-in Traefik reverse proxy (optional)?" "n")"
+  if [[ "$ENABLE_PROXY" == "y" ]]; then
+    START_PROXY_WITH_STACK="$(prompt_yes_no "Start proxy automatically with the stack (recommended)?" "y")"
+    TRAEFIK_BIND_IP="$(prompt "Traefik bind IP (80/443)" "$TRAEFIK_BIND_IP")"
+    LETSENCRYPT_EMAIL="$(prompt "Let's Encrypt email" "$LETSENCRYPT_EMAIL")"
+    JELLYFIN_HOST="$(prompt "Jellyfin hostname" "$JELLYFIN_HOST")"
+    MEDIAMANAGER_HOST="$(prompt "MediaManager hostname" "$MEDIAMANAGER_HOST")"
+    WIZARR_HOST="$(prompt "Wizarr hostname" "$WIZARR_HOST")"
+  fi
+
+  echo
+  echo "Tdarr hardware acceleration:"
+  echo "  1) None"
+  echo "  2) NVIDIA (requires NVIDIA Container Toolkit on host)"
+  echo "  3) Intel/AMD VAAPI (/dev/dri) (requires /dev/dri on host)"
+  local GPU_MODE
+  GPU_MODE="$(prompt "Select [1/2/3]" "1")"
+  case "$GPU_MODE" in
+    2)
+      TDARR_NVIDIA_GPUS="$(prompt "NVIDIA GPUs (0, 1, 2, or 'all')" "all")"
+      ENABLE_VAAPI="n"
+      ;;
+    3)
+      ENABLE_VAAPI="y"
+      TDARR_NVIDIA_GPUS="0"
+      RENDER_GID="$(prompt "Render group id (RENDER_GID) (often 109)" "0")"
+      if ! is_uint "$RENDER_GID"; then RENDER_GID="0"; fi
+      ;;
+    *)
+      TDARR_NVIDIA_GPUS="0"
+      ENABLE_VAAPI="n"
+      ;;
+  esac
+
+  echo
+  echo "=== Summary ==="
+  echo "Root:            $ROOT"
+  echo "Timezone:        $TZ_VALUE"
+  echo "Run as root:     $RUN_AS_ROOT (UID=$MEDIABLADE_UID GID=$MEDIABLADE_GID)"
+  echo "Bind IP:         $BIND_IP"
+  echo "Traefik enabled: $ENABLE_PROXY (auto-start: $START_PROXY_WITH_STACK)"
+  echo "Tdarr NVIDIA:    $TDARR_NVIDIA_GPUS"
+  echo "Tdarr VAAPI:     $ENABLE_VAAPI"
+
+  # === STEP 3: Install Docker (if needed) ===
+  echo
+  echo "=== Checking/Installing Docker ==="
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker not found, installing via convenience script..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    usermod -aG docker "$(id -u -n)" || true
+    systemctl enable --now docker
+  else
+    echo "Docker already installed."
+  fi
+
+  # === STEP 4: Create directory structure ===
+  echo
+  echo "=== Creating MediaBlade directories ==="
+  mkdir -p \
+    "$ROOT/media/movies" \
+    "$ROOT/media/tv" \
+    "$ROOT/downloads/incomplete" \
+    "$ROOT/downloads/complete" \
+    "$ROOT/downloads/jackett" \
+    "$ROOT/tdarr_cache" \
+    "$ROOT/traefik/letsencrypt"
+
+  # Apply ownership for non-root container mode (best-effort)
+  if [[ "$RUN_AS_ROOT" != "y" ]]; then
+    if [[ "$(id -u)" == "0" ]]; then
+      chown -R "${MEDIABLADE_UID}:${MEDIABLADE_GID}" \
+        "$ROOT/media" \
+        "$ROOT/downloads" \
+        "$ROOT/tdarr_cache" \
+        "$ROOT/traefik" \
+        || true
+    else
+      echo "Note: not running as root; skipping chown of $ROOT directories."
+    fi
+  fi
+
+  # Write .env from chosen options (overwrites existing for reproducibility)
+  local COMPOSE_PROFILES_LINE=""
+  if [[ "$ENABLE_PROXY" == "y" && "$START_PROXY_WITH_STACK" == "y" ]]; then
+    COMPOSE_PROFILES_LINE="COMPOSE_PROFILES=proxy"
+  fi
+  cat > "$ROOT/.env" << EOF
+# MediaBlade generated configuration
+TZ=${TZ_VALUE}
+BIND_IP=${BIND_IP}
+MEDIABLADE_UID=${MEDIABLADE_UID}
+MEDIABLADE_GID=${MEDIABLADE_GID}
+LOG_MAX_SIZE=10m
+LOG_MAX_FILE=3
+${COMPOSE_PROFILES_LINE}
+
+# Traefik reverse proxy (optional)
+TRAEFIK_ENABLE=$([[ "$ENABLE_PROXY" == "y" ]] && echo "true" || echo "false")
+TRAEFIK_BIND_IP=${TRAEFIK_BIND_IP}
+TRAEFIK_ENTRYPOINTS=websecure
+TRAEFIK_TLS=true
+TRAEFIK_CERTRESOLVER=le
+TRAEFIK_LOG_LEVEL=INFO
+TRAEFIK_DASHBOARD=false
+LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+JELLYFIN_HOST=${JELLYFIN_HOST}
+MEDIAMANAGER_HOST=${MEDIAMANAGER_HOST}
+WIZARR_HOST=${WIZARR_HOST}
+
+# Tdarr GPU options
+TDARR_NVIDIA_GPUS=${TDARR_NVIDIA_GPUS}
+NVIDIA_VISIBLE_DEVICES=
+NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+RENDER_GID=${RENDER_GID}
+EOF
+
+  # === STEP 5: Generate docker-compose.yml ===
+  echo
+  echo "=== Writing docker-compose.yml ==="
+  cat > "$ROOT/docker-compose.yml" << 'EOF'
+name: mediablade
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILE:-3}"
+
+x-security: &default-security
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  logging: *default-logging
+
+networks:
+  media:
+    driver: bridge
+  proxy:
+    driver: bridge
+
+volumes:
+  jellyfin_cache:
+  jellyfin_config:
+  jackett_config:
+  rdtclient_config:
+  bazarr_config:
+  tdarr_config:
+  tdarr_logs:
+  tdarr_server_config:
+  mediamanager_config:
+  wizarr_config:
+
+services:
+  traefik:
+    image: traefik:v3.3
+    profiles: ["proxy"]
+    container_name: mediablade-traefik
+    networks: [proxy]
+    ports:
+      - "${TRAEFIK_BIND_IP:-0.0.0.0}:80:80"
+      - "${TRAEFIK_BIND_IP:-0.0.0.0}:443:443"
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.${TRAEFIK_CERTRESOLVER:-le}.acme.tlschallenge=true"
+      - "--api.dashboard=${TRAEFIK_DASHBOARD:-false}"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/letsencrypt:/letsencrypt
+    <<: *default-security
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: mediablade-jellyfin
+    networks: [media, proxy]
+    user: "${MEDIABLADE_UID:-1000}:${MEDIABLADE_GID:-1000}"
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - jellyfin_config:/config
+      - jellyfin_cache:/cache
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8096:8096"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.jellyfin.rule=Host(`${JELLYFIN_HOST:-jellyfin.local}`)"
+      - "traefik.http.routers.jellyfin.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.jellyfin.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.jellyfin.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.jellyfin.loadbalancer.server.port=8096"
+    <<: *default-security
+
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: mediablade-jackett
+    networks: [media]
+    environment:
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - jackett_config:/config
+      - ./downloads/jackett:/downloads
+    ports:
+      - "${BIND_IP:-127.0.0.1}:9117:9117"
+    <<: *default-security
+
+  rdtclient:
+    image: rogerfar/rdtclient:latest
+    container_name: mediablade-rdtclient
+    networks: [media]
+    environment:
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - rdtclient_config:/data/db
+      - ./downloads:/data/downloads
+    ports:
+      - "${BIND_IP:-127.0.0.1}:6500:6500"
+    <<: *default-security
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: mediablade-flaresolverr
+    networks: [media]
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=${TZ:-Etc/UTC}
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8191:8191"
+    <<: *default-security
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: mediablade-bazarr
+    networks: [media]
+    environment:
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - bazarr_config:/config
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:6767:6767"
+    <<: *default-security
+
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: mediablade-tdarr
+    networks: [media]
+    environment:
+      - PUID=${MEDIABLADE_UID:-1000}
+      - PGID=${MEDIABLADE_GID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,video,utility}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-}
+    volumes:
+      - tdarr_config:/app/configs
+      - tdarr_logs:/app/logs
+      - tdarr_server_config:/app/server
+      - ./media:/media
+      - ./tdarr_cache:/temp
+    device_requests:
+      - driver: nvidia
+        count: ${TDARR_NVIDIA_GPUS:-0}
+        capabilities: [gpu]
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8265:8265"
+      - "${BIND_IP:-127.0.0.1}:8266:8266"
+    <<: *default-security
+
+  mediamanager:
+    image: ghcr.io/maxdorninger/mediamanager/mediamanager:latest
+    container_name: mediablade-mediamanager
+    networks: [media, proxy]
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - mediamanager_config:/app/data
+      - ./media:/media
+    ports:
+      - "${BIND_IP:-127.0.0.1}:8787:8787"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.mediamanager.rule=Host(`${MEDIAMANAGER_HOST:-mediamanager.local}`)"
+      - "traefik.http.routers.mediamanager.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.mediamanager.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.mediamanager.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.mediamanager.loadbalancer.server.port=8787"
+    <<: *default-security
+
+  wizarr:
+    image: ghcr.io/wizarrrr/wizarr:latest
+    container_name: mediablade-wizarr
+    networks: [media, proxy]
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - wizarr_config:/data
+    ports:
+      - "${BIND_IP:-127.0.0.1}:5690:5690"
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-mediablade_proxy}"
+      - "traefik.http.routers.wizarr.rule=Host(`${WIZARR_HOST:-wizarr.local}`)"
+      - "traefik.http.routers.wizarr.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.wizarr.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.wizarr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.wizarr.loadbalancer.server.port=5690"
+    <<: *default-security
+EOF
+
+  # Optional VAAPI override
+  local COMPOSE_FILE_ARGS="-f docker-compose.yml"
+  if [[ "$ENABLE_VAAPI" == "y" ]]; then
+    echo
+    echo "=== Writing docker-compose.vaapi.yml (Tdarr VAAPI) ==="
+    cat > "$ROOT/docker-compose.vaapi.yml" << 'EOF'
+services:
+  tdarr:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-0}"
+EOF
+    COMPOSE_FILE_ARGS="-f docker-compose.yml -f docker-compose.vaapi.yml"
+  fi
+
+  # === STEP 6: Install Python + requests via apt (24.04-safe) ===
+  echo
+  echo "=== Installing Python + requests (apt) ==="
+  apt update -y
+  apt install -y python3 python3-requests
+
+  # === STEP 7: Write media_organizer.py ===
+  echo
+  echo "=== Writing media_organizer.py ==="
+  cat > "$ROOT/media_organizer.py" << 'EOF'
+#!/usr/bin/env python3
+"""
+MediaBlade Organizer v2.1 - Ubuntu 24.04 friendly
+Organizes movies and TV + optional Discord webhook summary.
+"""
+
+import re
+import shutil
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Optional
+import logging
+
+import requests  # installed via python3-requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class MediaOrganizer:
+    def __init__(self, root_path: str, dry_run: bool = False, discord_webhook: Optional[str] = None):
+        self.root = Path(root_path)
+        self.movies_root = self.root / "media" / "movies"
+        self.tv_root = self.root / "media" / "tv"
+        self.dry_run = dry_run
+        self.discord_webhook = discord_webhook
+
+        self.video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv"}
+        self.subtitle_exts = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+
+        self.summary = {
+            "movies_organized": 0,
+            "movies_skipped": 0,
+            "tv_organized": 0,
+            "tv_skipped": 0,
+        }
+
+    # ---------- Discord ----------
+
+    def send_discord(self, title: str, message: str, color: str = "success") -> None:
+        if not self.discord_webhook:
+            return
+
+        colors = {"success": 0x00FF00, "warning": 0xFF9900, "error": 0xFF0000}
+        embed = {
+            "title": f"🎬 {title}",
+            "description": message,
+            "color": colors.get(color, 0x00FF00),
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {"text": "MediaBlade Organizer"},
+        }
+
+        try:
+            requests.post(self.discord_webhook, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.error("Discord send failed: %s", e)
+
+    # ---------- Parsing helpers ----------
+
+    def parse_movie_filename(self, filename: str) -> Optional[Tuple[str, int]]:
+        patterns = [
+            r"^(.+?)[. _-]+(?P<year>\d{4})[. _]",
+            r"^(.+?)[. _]*\(?(?P<year>\d{4})\)?[. _]",
+        ]
+        filename = re.sub(r"[\[\]]", "", filename)
+        for pattern in patterns:
+            m = re.match(pattern, filename, re.IGNORECASE)
+            if not m:
+                continue
+            title = (
+                m.group(1)
+                .strip(".- ")
+                .replace(".", " ")
+                .replace("_", " ")
+                .strip()
+            )
+            year = int(m.group("year"))
+            if 1900 <= year <= 2026:
+                return title, year
+        return None
+
+    def parse_tv_filename(self, filename: str) -> Optional[Tuple[str, int, int, str]]:
+        patterns = [
+            r"^(?P<show>.+?)[. _]+S(?P<season>\d+)[. _]*E(?P<episode>\d+)(?:[._-].*)?(?P<title>.*)?[. _]",
+            r"^(?P<show>.+?)[. _]+(?P<season>\d+)x(?P<episode>\d+)(?:[._-].*)?(?P<title>.*)?[. _]",
+        ]
+        filename = re.sub(r"[\[\]]", "", filename)
+        for pattern in patterns:
+            m = re.match(pattern, filename, re.IGNORECASE)
+            if not m:
+                continue
+            show = (
+                m.group("show")
+                .strip(".- ")
+                .replace(".", " ")
+                .replace("_", " ")
+                .strip()
+            )
+            season = int(m.group("season"))
+            episode = int(m.group("episode"))
+            title = m.group("title").strip(".- ") if m.group("title") else f"Episode {episode}"
+            return show, season, episode, title
+        return None
+
+    # ---------- File helpers ----------
+
+    def get_video_files(self, path: Path) -> List[Path]:
+        files: List[Path] = []
+        for ext in self.video_exts:
+            files.extend(path.rglob(f"*{ext}"))
+        return sorted(files)
+
+    def find_associated_subs(self, video_path: Path) -> List[Path]:
+        subs: List[Path] = []
+        stem = video_path.stem
+        for ext in self.subtitle_exts:
+            subs.extend(video_path.parent.glob(f"{stem}*{ext}"))
+        return sorted(subs)
+
+    # ---------- Movie handling ----------
+
+    def organize_movie(self, video_path: Path) -> None:
+        parsed = self.parse_movie_filename(video_path.name)
+        if not parsed:
+            self.summary["movies_skipped"] += 1
+            return
+
+        title, year = parsed
+        dest_folder = self.movies_root / f"[{title}] [{year}]"
+
+        if dest_folder == video_path.parent:
+            self.summary["movies_skipped"] += 1
+            return
+
+        logger.info("📽️  [%s] [%s] <- %s", title, year, video_path.name)
+
+        if not self.dry_run:
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_path), str(dest_folder / video_path.name))
+            for sub in self.find_associated_subs(video_path):
+                if sub.exists():
+                    shutil.move(str(sub), str(dest_folder / sub.name))
+
+        self.summary["movies_organized"] += 1
+
+    def run_movies(self) -> None:
+        logger.info("🎬 Scanning movies: %s", self.movies_root)
+        videos = self.get_video_files(self.movies_root)
+        logger.info("Found %d movie files", len(videos))
+        for v in videos:
+            self.organize_movie(v)
+
+    # ---------- TV handling ----------
+
+    def organize_tv(self, video_path: Path) -> None:
+        parsed = self.parse_tv_filename(video_path.name)
+        if not parsed:
+            self.summary["tv_skipped"] += 1
+            return
+
+        show, season, episode, title = parsed
+        show_year = 2025  # Placeholder until you add real metadata
+        show_folder = self.tv_root / f"[{show}] [{show_year}]"
+        season_folder = show_folder / f"Season {season} [{show_year}]"
+        new_name = f"EP{episode} - {title} [{show_year}]{video_path.suffix}"
+        dest_video = season_folder / new_name
+
+        if season_folder == video_path.parent and video_path.name == new_name:
+            self.summary["tv_skipped"] += 1
+            return
+
+        logger.info("📺 [%s] S%02dE%02d <- %s", show, season, episode, video_path.name)
+
+        if not self.dry_run:
+            season_folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_path), str(dest_video))
+            for sub in self.find_associated_subs(video_path):
+                if sub.exists():
+                    new_sub = season_folder / f"{new_name.rsplit('.',1)[0]}{sub.suffix}"
+                    shutil.move(str(sub), str(new_sub))
+
+        self.summary["tv_organized"] += 1
+
+    def run_tv(self) -> None:
+        logger.info("📺 Scanning TV: %s", self.tv_root)
+        videos = self.get_video_files(self.tv_root)
+        logger.info("Found %d TV files", len(videos))
+        for v in videos:
+            self.organize_tv(v)
+
+    # ---------- Main ----------
+
+    def run(self) -> None:
+        start = datetime.now()
+        logger.info("MediaBlade Organizer starting at %s", self.root)
+        self.run_movies()
+        self.run_tv()
+        elapsed = (datetime.now() - start).total_seconds()
+
+        msg = (
+            f"Movies: {self.summary['movies_organized']} organized, "
+            f"{self.summary['movies_skipped']} skipped\n"
+            f"TV: {self.summary['tv_organized']} organized, "
+            f"{self.summary['tv_skipped']} skipped\n"
+            f"Runtime: {elapsed:.0f}s"
+        )
+
+        total = self.summary["movies_organized"] + self.summary["tv_organized"]
+        if total > 0:
+            self.send_discord("✅ Media Organized", msg, "success")
+        else:
+            self.send_discord("ℹ️ No Changes", "No new media to organize", "warning")
+
+        logger.info("Done. %s", msg)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MediaBlade Media Organizer")
+    parser.add_argument("root_path", nargs="?", default=".")
+    parser.add_argument("--movies-only", action="store_true")
+    parser.add_argument("--tv-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--discord-webhook")
+    args = parser.parse_args()
+
+    organizer = MediaOrganizer(
+        root_path=args.root_path,
+        dry_run=args.dry_run,
+        discord_webhook=args.discord_webhook,
+    )
+
+    if args.movies_only:
+        organizer.run_movies()
+    elif args.tv_only:
+        organizer.run_tv()
+    else:
+        organizer.run()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+  chmod +x "$ROOT/media_organizer.py"
+
+  # === STEP 8: systemd units ===
+  echo
+  echo "=== Writing systemd units ==="
+
+  # Docker stack service
+  cat > /etc/systemd/system/mediablade.service << EOF
+[Unit]
+Description=MediaBlade Docker Stack
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=${ROOT}
+ExecStart=/usr/bin/docker compose ${COMPOSE_FILE_ARGS} up -d
+ExecStop=/usr/bin/docker compose ${COMPOSE_FILE_ARGS} down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Organizer service
+  local ORG_ARGS=""
+  if [[ -n "$WEBHOOK" ]]; then
+    ORG_ARGS="--discord-webhook=${WEBHOOK}"
+  fi
+
+  cat > /etc/systemd/system/mediablade-organizer.service << EOF
+[Unit]
+Description=MediaBlade Media Organizer
+After=mediablade.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${ROOT}
+ExecStart=/usr/bin/python3 ${ROOT}/media_organizer.py . ${ORG_ARGS}
+User=$(id -u)
+Group=$(id -g)
+StandardOutput=append:${ROOT}/organizer.log
+StandardError=append:${ROOT}/organizer.log
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Organizer timer
+  cat > /etc/systemd/system/mediablade-organizer.timer << 'EOF'
+[Unit]
+Description=Run MediaBlade Organizer hourly
+Requires=mediablade-organizer.service
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # === STEP 9: enable + start ===
+  echo
+  echo "=== Enabling services and starting stack ==="
+  systemctl daemon-reload
+  systemctl enable mediablade.service mediablade-organizer.timer
+  systemctl start mediablade.service
+  systemctl start mediablade-organizer.timer
+
+  # Quick dry-run test
+  echo
+  echo "=== Running organizer dry-run test ==="
+  /usr/bin/python3 "$ROOT/media_organizer.py" . --dry-run || true
+
+  echo
+  echo "=============================================="
+  echo " MediaBlade installation complete!"
+  echo " Stack root: $ROOT"
+  echo "----------------------------------------------"
+  echo "Bind IP: ${BIND_IP}"
+  if [[ "$ENABLE_PROXY" == "y" ]]; then
+    echo "Reverse proxy: enabled (Traefik)"
+    echo "  Jellyfin host:     ${JELLYFIN_HOST}"
+    echo "  MediaManager host: ${MEDIAMANAGER_HOST}"
+    echo "  Wizarr host:       ${WIZARR_HOST}"
+    echo "  Note: if you did NOT auto-start the proxy, run:"
+    echo "    docker compose --profile proxy up -d"
+  else
+    echo "Reverse proxy: disabled"
+  fi
+  echo
+  echo "Service ports:"
+  echo "  Jellyfin:     http://${BIND_IP}:8096"
+  echo "  MediaManager: http://${BIND_IP}:8787"
+  echo "  Wizarr:       http://${BIND_IP}:5690"
+  echo "  Jackett:      http://${BIND_IP}:9117"
+  echo
+  echo "Check services:"
+  echo "  systemctl status mediablade.service"
+  echo "  systemctl status mediablade-organizer.timer"
+  echo
+  echo "Logs:"
+  echo "  docker compose logs -f      (in $ROOT)"
+  echo "  tail -f $ROOT/organizer.log"
+  echo "=============================================="
+}
+
+main "$@"
+
